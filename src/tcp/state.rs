@@ -37,11 +37,11 @@
 ///   request).
 #[derive(Debug, Default)]
 pub enum State {
-    Closed,
     #[default]
-    Listen,
+    // Closed,
+    // Listen,
     SynReceived,
-    // Established,
+    Established,
     // FinWait1,
     // FinWait2,
     // CloseWait,
