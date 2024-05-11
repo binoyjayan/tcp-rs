@@ -1,10 +1,11 @@
 use etherparse::{IpNumber, Ipv4HeaderSlice, TcpHeaderSlice};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io;
 
 mod tcp;
 
-use tcp::{Tcp4Tuple, TcpState};
+use tcp::connection::{self, Connection, Tcp4Tuple};
 
 const TUN_FRAME_LEN: usize = 4;
 const MTU: usize = 1500;
@@ -13,7 +14,7 @@ fn main() -> io::Result<()> {
     let nic = tun_tap::Iface::new("tun0", tun_tap::Mode::Tun).expect("Failed to create TUN device");
     // Create a buffer. 4 bytes to hold extra tun frame format
     let mut buf = [0u8; MTU + TUN_FRAME_LEN];
-    let mut connections: HashMap<Tcp4Tuple, TcpState> = HashMap::new();
+    let mut connections: HashMap<Tcp4Tuple, Connection> = HashMap::new();
 
     loop {
         let nbytes = nic.recv(&mut buf[..])?;
@@ -40,13 +41,23 @@ fn main() -> io::Result<()> {
                         let tcp_len = tcp.slice().len();
                         let data_off = TUN_FRAME_LEN + ip_len + tcp_len;
                         let data = &buf[data_off..nbytes];
-                        connections
-                            .entry(Tcp4Tuple {
-                                src: (src, srcp),
-                                dst: (dst, dstp),
-                            })
-                            .or_default()
-                            .on_packet(ip, tcp, data);
+                        match connections.entry(Tcp4Tuple {
+                            src: (src, srcp),
+                            dst: (dst, dstp),
+                        }) {
+                            Entry::Occupied(mut entry) => {
+                                let conn = entry.get_mut();
+                                conn.on_packet(&nic, ip, tcp, data)
+                                    .map_err(|e| eprintln!("Error processing packet: {:?}", e))
+                                    .ok();
+                            }
+                            Entry::Vacant(e) => match Connection::accept(&nic, ip, tcp, data) {
+                                Ok(c) => {
+                                    e.insert(c);
+                                }
+                                Err(e) => eprintln!("Error creating connection: {:?}", e),
+                            },
+                        }
                     }
                     Err(e) => {
                         eprintln!("Ignoring packet. len:{} Err: {}", nbytes, e);
