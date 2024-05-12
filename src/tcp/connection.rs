@@ -1,5 +1,6 @@
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 use std::io;
+use std::io::Write;
 use std::net::Ipv4Addr;
 
 use super::sequence::ReceiveSequenceSpace;
@@ -21,7 +22,8 @@ pub struct Connection {
     state: State,
     send: SendSequenceSpace,
     receive: ReceiveSequenceSpace,
-    tcp4tuple: Tcp4Tuple,
+    ip: Ipv4Header,
+    tcp: TcpHeader,
 }
 
 impl Connection {
@@ -61,22 +63,17 @@ impl Connection {
         let send = SendSequenceSpace {
             iss,
             una: iss,
-            nxt: iss + 1,
+            nxt: iss,
             wnd: WINDOW_SIZE,
             urgent: 0,
             wl1: tcp.sequence_number(),
             wl2: iss + WINDOW_SIZE as u32,
         };
 
-        let tcp4tuple = Tcp4Tuple {
-            src: (src, srcp),
-            dst: (dst, dstp),
-        };
-
+        // Flip source and destination in the response
         let mut resp_tcp = TcpHeader::new(dstp, srcp, send.iss, send.wnd);
         resp_tcp.syn = true;
         resp_tcp.ack = true;
-        resp_tcp.acknowledgment_number = receive.nxt;
 
         let resp_ip = Ipv4Header::new(
             resp_tcp.header_len() as u16,
@@ -87,43 +84,149 @@ impl Connection {
         )
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
 
-        // Calculate checksum
-        resp_tcp.checksum = resp_tcp
-            .calc_checksum_ipv4(&resp_ip, &[])
-            .expect("checksum failed");
-
-        let mut buf = [0u8; 1504];
-        let mut cursor = io::Cursor::new(&mut buf[..]);
-        resp_ip.write(&mut cursor)?;
-        resp_tcp.write(&mut cursor)?;
-        let len = cursor.position() as usize;
-        nic.send(&buf[0..len])?;
-
-        Ok(Connection {
+        let mut conn = Connection {
             state: State::SynReceived,
             send,
             receive,
-            tcp4tuple,
-        })
+            ip: resp_ip,
+            tcp: resp_tcp,
+        };
+        conn.write(nic, &[])?;
+        Ok(conn)
+    }
+
+    pub fn write(&mut self, nic: &tun_tap::Iface, payload: &[u8]) -> io::Result<usize> {
+        let mut buf = [0u8; 1500];
+        self.tcp.sequence_number = self.send.nxt;
+        self.tcp.acknowledgment_number = self.receive.nxt;
+
+        let size = std::cmp::min(buf.len(), self.tcp.header_len() + payload.len());
+        let _ = self.ip.set_payload_len(size);
+
+        // Calculate checksum
+        self.tcp.checksum = self
+            .tcp
+            .calc_checksum_ipv4(&self.ip, payload)
+            .expect("checksum failed");
+        let mut cursor = io::Cursor::new(&mut buf[..]);
+        self.ip.write(&mut cursor)?;
+        self.tcp.write(&mut cursor)?;
+        let payload_bytes = cursor.write(payload)?;
+        let len = cursor.position() as usize;
+
+        // Adjust send sequence space
+        self.send.nxt = self.send.nxt.wrapping_add(payload_bytes as u32);
+        if self.tcp.syn {
+            self.send.nxt = self.send.nxt.wrapping_add(1);
+            self.tcp.syn = false;
+        }
+        if self.tcp.fin {
+            self.send.nxt = self.send.nxt.wrapping_add(1);
+            self.tcp.fin = false;
+        }
+        let num = nic.send(&buf[0..len])?;
+        Ok(num)
     }
 
     pub fn on_packet(
-        &self,
-        _nic: &tun_tap::Iface,
+        &mut self,
+        nic: &tun_tap::Iface,
         _ip: Ipv4HeaderSlice,
         tcp: TcpHeaderSlice,
-        _data: &[u8],
+        data: &[u8],
     ) -> io::Result<()> {
-        // Acceptable ACK check: SDN < SEG.ACK =< SND.NXT
-        if !(self.send.una < tcp.acknowledgment_number()
-            && tcp.acknowledgment_number() <= self.send.nxt)
-        {
+        let ack = tcp.acknowledgment_number();
+        let seq = tcp.sequence_number();
+        let wend = self.receive.nxt.wrapping_add(self.receive.wnd as u32);
+
+        // Acceptable ACK check: SND.UNA < SEG.ACK =< SND.NXT
+        if !Self::is_between_wrapped(self.send.una, ack, self.send.nxt.wrapping_add(1)) {
+            if !self.state.is_sync() {
+                // Reset Generation: Send RST
+                self.send_rst(&nic)?;
+            }
             return Ok(());
         }
+
+        let mut slen = data.len() as u32;
+        if tcp.syn() {
+            slen += 1;
+        }
+        if tcp.fin() {
+            slen += 1;
+        }
+
+        // Segment check:
+        // RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
+        // or
+        // RCV.NXT =< SEG.SEQ + SEG.LEN-1 < RCV.NXT+RCV.WND
+
+        if slen == 0 && !tcp.syn() && !tcp.fin() {
+            // zero length segment
+            if self.receive.wnd == 0 {
+                if seq != self.receive.nxt {
+                    // Not acceptable
+                    return Ok(());
+                }
+            } else if !Self::is_between_wrapped(self.receive.nxt.wrapping_sub(1), seq, wend) {
+                return Ok(());
+            }
+        } else {
+            if self.receive.wnd == 0 {
+                // Not Acceptable
+                return Ok(());
+            } else if !Self::is_between_wrapped(
+                self.receive.nxt.wrapping_sub(1),
+                seq + slen - 1,
+                wend,
+            ) {
+                return Ok(());
+            }
+        }
+
         match self.state {
-            State::SynReceived => {}
+            State::SynReceived => {
+                // expect to get ACK for our SYN
+                if !tcp.ack() {
+                    return Ok(());
+                }
+                self.state = State::Established;
+                // terminate the connection
+            }
             State::Established => {}
         }
+        Ok(())
+    }
+
+    /// Returns false if check failed
+    fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
+        use std::cmp::Ordering;
+        match start.cmp(&x) {
+            Ordering::Equal => {
+                return false;
+            }
+            Ordering::Less => {
+                // check fails iff end is between start and x
+                if end >= start && end <= x {
+                    return false;
+                }
+            }
+            Ordering::Greater => {
+                // check fails iff x is NOT between start and x
+                if !(end < start && end > x) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    pub fn send_rst(&mut self, nic: &tun_tap::Iface) -> io::Result<()> {
+        // TODO: fix seq numbers and handle synchronized RST
+        self.tcp.rst = true;
+        self.tcp.sequence_number = 0;
+        self.tcp.acknowledgment_number = 0;
+        self.write(nic, &[])?;
         Ok(())
     }
 }

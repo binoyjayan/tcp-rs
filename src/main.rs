@@ -18,6 +18,10 @@ fn main() -> io::Result<()> {
 
     loop {
         let nbytes = nic.recv(&mut buf[..])?;
+        let version = buf[0] >> 4;
+        if version != 4 {
+            continue; // ignore non-ip
+        }
         match Ipv4HeaderSlice::from_slice(&buf[..nbytes]) {
             Ok(ip) => {
                 let src = ip.source_addr();

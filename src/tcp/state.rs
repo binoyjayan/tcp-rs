@@ -48,3 +48,9 @@ pub enum State {
     // Closing,
     // LastAck,
 }
+
+impl State {
+    pub fn is_sync(&self) -> bool {
+        matches!(self, Self::Established)
+    }
+}
