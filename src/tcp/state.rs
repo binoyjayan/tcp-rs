@@ -42,15 +42,19 @@ pub enum State {
     // Listen,
     SynReceived,
     Established,
-    // FinWait1,
-    // FinWait2,
+    FinWait1,
+    FinWait2,
     // CloseWait,
     // Closing,
+    TimeWait,
     // LastAck,
 }
 
 impl State {
     pub fn is_sync(&self) -> bool {
-        matches!(self, Self::Established)
+        matches!(
+            self,
+            Self::Established | Self::FinWait1 | Self::FinWait2 | Self::TimeWait
+        )
     }
 }
