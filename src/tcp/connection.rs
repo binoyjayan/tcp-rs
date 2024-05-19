@@ -100,8 +100,11 @@ impl Connection {
         self.tcp.sequence_number = self.send.nxt;
         self.tcp.acknowledgment_number = self.receive.nxt;
 
-        let size = std::cmp::min(buf.len(), self.tcp.header_len() + payload.len());
-        let _ = self.ip.set_payload_len(size);
+        let size = std::cmp::min(
+            buf.len(),
+            self.ip.header_len() + self.tcp.header_len() + payload.len(),
+        );
+        let _ = self.ip.set_payload_len(size - self.ip.header_len());
 
         // Calculate checksum
         self.tcp.checksum = self
@@ -150,27 +153,43 @@ impl Connection {
         // or
         // RCV.NXT =< SEG.SEQ + SEG.LEN-1 < RCV.NXT+RCV.WND
         let wend = self.receive.nxt.wrapping_add(self.receive.wnd as u32);
-        if slen == 0 {
+        let okay = if slen == 0 {
             // zero length segment
             if self.receive.wnd == 0 {
                 if seq != self.receive.nxt {
                     // Not acceptable
-                    return Ok(());
+                    // return Ok(());
+                    false
+                } else {
+                    true
                 }
             } else if !Self::is_between_wrapped(self.receive.nxt.wrapping_sub(1), seq, wend) {
-                return Ok(());
+                // return Ok(());
+                false
+            } else {
+                true
             }
         } else {
             if self.receive.wnd == 0 {
                 // Not Acceptable
-                return Ok(());
-            } else if !Self::is_between_wrapped(
-                self.receive.nxt.wrapping_sub(1),
-                seq.wrapping_add(slen - 1),
-                wend,
-            ) {
-                return Ok(());
+                // return Ok(());
+                false
+            } else if !Self::is_between_wrapped(self.receive.nxt.wrapping_sub(1), seq, wend)
+                && !Self::is_between_wrapped(
+                    self.receive.nxt.wrapping_sub(1),
+                    seq.wrapping_add(slen - 1),
+                    wend,
+                )
+            {
+                // return Ok(());
+                false
+            } else {
+                true
             }
+        };
+        if !okay {
+            self.write(nic, &[])?;
+            return Ok(());
         }
         // Adjust receive sequence space: we have accepted the segment
         self.receive.nxt = seq.wrapping_add(slen);
@@ -179,43 +198,38 @@ impl Connection {
         // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 
         if !tcp.ack() {
-            eprintln!("NOT ACK");
             return Ok(());
         }
         let ack = tcp.acknowledgment_number();
         // Acceptable ACK check: SND.UNA < SEG.ACK =< SND.NXT
-        if !Self::is_between_wrapped(self.send.una, ack, self.send.nxt.wrapping_add(1)) {
-            if !self.state.is_sync() {
-                // Reset Generation: Send RST
-                self.send_rst(&nic)?;
-            }
-            return Ok(());
-        }
-        // First un-ACKed byte - same as the next byte the receiver expects
-        self.send.una = ack;
-
         if let State::SynReceived = self.state {
-            if !Self::is_between_wrapped(
+            if Self::is_between_wrapped(
                 self.send.una.wrapping_sub(1),
+                // self.send.una,
                 ack,
                 self.send.nxt.wrapping_add(1),
             ) {
+                // The peer must have ACK-ed out SYN, since we detected atleast
+                // one ACK-ed byte which was for the to SYN
                 self.state = State::Established;
             } else {
                 //TODO: Form a RST segment: SEQ=SEG.ACK><CTL=RST>
             }
         }
 
-        if let State::Established = self.state {
+        if let State::Established | State::FinWait1 | State::FinWait2 = self.state {
             if !Self::is_between_wrapped(self.send.una, ack, self.send.nxt.wrapping_add(1)) {
                 return Ok(());
             }
-            // self.send.una = ack;
+            self.send.una = ack;
             assert!(data.is_empty());
-            // terminate the connection for now
-            self.tcp.fin = true;
-            self.write(nic, &[])?;
-            self.state = State::FinWait1;
+
+            if let State::Established = self.state {
+                // terminate the connection for now
+                self.tcp.fin = true;
+                self.write(nic, &[])?;
+                self.state = State::FinWait1;
+            }
         }
 
         if let State::FinWait1 = self.state {
@@ -227,6 +241,7 @@ impl Connection {
 
         if tcp.fin() {
             if let State::FinWait2 = self.state {
+                eprintln!("Received ACK for FIN");
                 // Connection terminated
                 // Sender would have ACK-ed our FIN - ACK sender's FIN
                 // self.tcp.fin = false;

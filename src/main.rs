@@ -53,7 +53,7 @@ fn main() -> io::Result<()> {
                                 Ok(c) => {
                                     e.insert(c);
                                 }
-                                Err(e) => eprintln!("Error creating connection: {:?}", e),
+                                Err(e) => eprintln!("Error accepting connection: {:?}", e),
                             },
                         }
                     }
