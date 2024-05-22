@@ -51,7 +51,7 @@ pub enum State {
 }
 
 impl State {
-    pub fn is_sync(&self) -> bool {
+    pub fn _is_sync(&self) -> bool {
         matches!(
             self,
             Self::Established | Self::FinWait1 | Self::FinWait2 | Self::TimeWait

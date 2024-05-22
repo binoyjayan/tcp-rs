@@ -157,37 +157,31 @@ impl Connection {
             // zero length segment
             if self.receive.wnd == 0 {
                 if seq != self.receive.nxt {
-                    // Not acceptable
-                    // return Ok(());
                     false
                 } else {
                     true
                 }
             } else if !Self::is_between_wrapped(self.receive.nxt.wrapping_sub(1), seq, wend) {
-                // return Ok(());
                 false
             } else {
                 true
             }
+        } else if self.receive.wnd == 0 {
+            false
+        } else if !Self::is_between_wrapped(self.receive.nxt.wrapping_sub(1), seq, wend)
+            && !Self::is_between_wrapped(
+                self.receive.nxt.wrapping_sub(1),
+                seq.wrapping_add(slen - 1),
+                wend,
+            )
+        {
+            false
         } else {
-            if self.receive.wnd == 0 {
-                // Not Acceptable
-                // return Ok(());
-                false
-            } else if !Self::is_between_wrapped(self.receive.nxt.wrapping_sub(1), seq, wend)
-                && !Self::is_between_wrapped(
-                    self.receive.nxt.wrapping_sub(1),
-                    seq.wrapping_add(slen - 1),
-                    wend,
-                )
-            {
-                // return Ok(());
-                false
-            } else {
-                true
-            }
+            true
         };
+
         if !okay {
+            // Not acceptable
             self.write(nic, &[])?;
             return Ok(());
         }
@@ -308,7 +302,7 @@ impl Connection {
         lhs.wrapping_sub(rhs) > u32::max_value() >> 1
     }
 
-    pub fn send_rst(&mut self, nic: &tun_tap::Iface) -> io::Result<()> {
+    pub fn _send_rst(&mut self, nic: &tun_tap::Iface) -> io::Result<()> {
         // TODO: fix seq numbers and handle synchronized RST
         self.tcp.rst = true;
         self.tcp.sequence_number = 0;
