@@ -222,7 +222,9 @@ impl Connection {
                 return Ok(());
             }
             self.send.una = ack;
-            assert!(data.is_empty());
+            if !data.is_empty() {
+                println!("Data is not empty");
+            }
 
             if let State::Established = self.state {
                 // terminate the connection for now
@@ -253,27 +255,57 @@ impl Connection {
         Ok(())
     }
 
-    /// Returns false if check failed
+    /// TCP half-domain wrapping
+    ///
+    /// It is essential to remember that the actual sequence number space is
+    /// finite, though very large.  This space ranges from 0 to 2**32 - 1.
+    /// Since the space is finite, all arithmetic dealing with sequence
+    /// numbers must be performed modulo 2**32.  This unsigned arithmetic
+    /// preserves the relationship of sequence numbers as they cycle from
+    /// 2**32 - 1 to 0 again. The symbol "=<" means "less than or equal"
+    /// [modulo 2**32].
+    ///
+    /// RFC 1323:
+    /// TCP determines if a data segment is "old" or "new" by testing
+    /// whether its sequence number is within 2**31 bytes of the left edge
+    /// of the window, and if it is not, discarding the data as "old".  To
+    /// insure that new data is never mistakenly considered old and vice-
+    /// versa, the left edge of the sender's window has to be at most
+    /// 2**31 away from the right edge of the receiver's window.
+    ///
+    /// This function checks if a sequence number `x` is between `start` and `end`
+    /// in a circular space, considering the wrapping behavior of TCP sequence numbers.
+    ///
+    /// # Arguments
+    ///
+    /// * `start` - The starting sequence number of the range.
+    /// * `x` - The sequence number to check.
+    /// * `end` - The ending sequence number of the range.
+    ///
+    /// # Returns
+    ///
+    /// * `true` if `x` is between `start` and `end` in the circular sequence space.
+    /// * `false` otherwise.
     fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
-        use std::cmp::Ordering;
-        match start.cmp(&x) {
-            Ordering::Equal => {
-                return false;
-            }
-            Ordering::Less => {
-                // check fails iff end is between start and x
-                if end >= start && end <= x {
-                    return false;
-                }
-            }
-            Ordering::Greater => {
-                // check fails iff x is NOT between start and x
-                if !(end < start && end > x) {
-                    return false;
-                }
-            }
-        }
-        true
+        Self::wrapping_lt(start, x) && Self::wrapping_lt(x, end)
+    }
+
+    /// Compares two sequence numbers using TCP's sequence number wrapping rules.
+    ///
+    /// This function returns `true` if `lhs` is less than `rhs` in the circular
+    /// sequence space, considering the wrapping behavior.
+    ///
+    /// # Arguments
+    ///
+    /// * `lhs` - The left-hand side sequence number.
+    /// * `rhs` - The right-hand side sequence number.
+    ///
+    /// # Returns
+    ///
+    /// * `true` if `lhs` is less than `rhs` in the circular sequence space.
+    /// * `false` otherwise.
+    fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
+        lhs.wrapping_sub(rhs) > u32::max_value() >> 1
     }
 
     pub fn send_rst(&mut self, nic: &tun_tap::Iface) -> io::Result<()> {
