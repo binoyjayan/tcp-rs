@@ -1,4 +1,5 @@
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
+use std::collections::VecDeque;
 use std::io;
 use std::io::Write;
 use std::net::Ipv4Addr;
@@ -24,6 +25,9 @@ pub struct Connection {
     receive: ReceiveSequenceSpace,
     ip: Ipv4Header,
     tcp: TcpHeader,
+
+    pub ingress: VecDeque<u8>,
+    pub unacked: VecDeque<u8>,
 }
 
 impl Connection {
@@ -90,6 +94,8 @@ impl Connection {
             receive,
             ip: resp_ip,
             tcp: resp_tcp,
+            ingress: VecDeque::new(),
+            unacked: VecDeque::new(),
         };
         conn.write(nic, &[])?;
         Ok(conn)
@@ -156,11 +162,7 @@ impl Connection {
         let okay = if slen == 0 {
             // zero length segment
             if self.receive.wnd == 0 {
-                if seq != self.receive.nxt {
-                    false
-                } else {
-                    true
-                }
+                seq == self.receive.nxt
             } else if !Self::is_between_wrapped(self.receive.nxt.wrapping_sub(1), seq, wend) {
                 false
             } else {
