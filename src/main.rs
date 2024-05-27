@@ -11,11 +11,17 @@ fn main() -> io::Result<()> {
     let jh1 = thread::spawn(move || {
         while let Ok(mut stream) = list1.accept() {
             eprintln!("Connected");
-            let n = stream.read(&mut [0]).unwrap();
-            eprintln!("Read data");
-            assert_eq!(n, 0);
+            loop {
+                let mut buf = [0u8; 512];
+                let n = stream.read(&mut buf).unwrap();
+                eprintln!("Read {} bytes of data", n);
+                if n == 0 {
+                    break;
+                }
+            }
         }
     });
     let _ = jh1.join();
     Ok(())
 }
+

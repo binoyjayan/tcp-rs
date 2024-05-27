@@ -241,10 +241,10 @@ impl io::Read for TcpStream {
                 let mut nread = 0;
                 let (head, tail) = conn.ingress.as_slices();
                 let hread = std::cmp::min(buf.len(), head.len());
-                buf.copy_from_slice(&head[..hread]);
+                buf[..hread].copy_from_slice(&head[..hread]);
                 nread += hread;
                 let tread = std::cmp::min(buf.len() - nread, tail.len());
-                buf.copy_from_slice(&tail[..tread]);
+                buf[nread..hread + tread].copy_from_slice(&tail[..tread]);
                 nread += tread;
                 drop(conn.ingress.drain(..nread));
                 return Ok(nread);

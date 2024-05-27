@@ -41,7 +41,9 @@ impl Connection {
         }
     }
 
-    /// Function to indicate read and write availability
+    /// Function to indicate read and write availability.
+    /// Marking data availability will helps decidie waking processes up
+    /// that are waiting for data to be available
     fn availability(&self) -> Available {
         let mut avail = Available::empty();
         if self.is_recv_closed() || !self.ingress.is_empty() {
@@ -208,12 +210,16 @@ impl Connection {
             return Ok(self.availability());
         }
         // Adjust receive sequence space: we have accepted the segment
-        self.receive.nxt = seq.wrapping_add(slen);
+        // self.receive.nxt = seq.wrapping_add(slen);
 
         // TODO: If not acceptable, send ACK, drop segment and return
         // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 
         if !tcp.ack() {
+            if tcp.syn() {
+                // SYN as part of initial handshake
+                self.receive.nxt = seq.wrapping_add(1);
+            }
             return Ok(self.availability());
         }
         let ack = tcp.acknowledgment_number();
@@ -238,16 +244,28 @@ impl Connection {
                 self.send.una = ack;
             }
 
-            if !data.is_empty() {
-                println!("Data is not empty");
-            }
-
+            // Since we do not have anything to send, indicate FIN from us
             if let State::Established = self.state {
-                // terminate the connection for now
                 self.tcp.fin = true;
-                self.write(nic, &[])?;
                 self.state = State::FinWait1;
             }
+
+            // offset to unread data
+            let mut offset = self.receive.nxt.saturating_sub(seq) as usize;
+            // nxt points to beyond the FIN but FIN is not in data
+            if offset > data.len() {
+                offset = offset.saturating_sub(1);
+            }
+
+            // Send ACK
+            self.write(nic, &[])?;
+
+            self.ingress.extend(&data[offset..]);
+            // Adjust receive sequence space: we have accepted the segment
+
+            self.receive.nxt = seq
+                .wrapping_add(data.len() as u32)
+                .wrapping_add(if tcp.fin() { 1 } else { 0 });
         }
 
         if let State::FinWait1 = self.state {
