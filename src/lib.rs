@@ -8,7 +8,10 @@ use std::{
 
 mod tcp;
 
-use tcp::connection::{Connection, Tcp4Tuple};
+use tcp::{
+    connection::{Connection, Tcp4Tuple},
+    state::Available,
+};
 
 const BUFFER_SIZE: usize = 1504;
 const SEND_QUEUE_SIZE: usize = 1024;
@@ -20,6 +23,7 @@ type InterfaceHandle = Arc<InterfaceManager>;
 struct InterfaceManager {
     manager: Mutex<ConnectionManager>,
     pending_var: Condvar,
+    receive_var: Condvar,
 }
 
 /// struct for managing connections.
@@ -83,9 +87,20 @@ fn packet_loop(nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
                         match cm.connections.entry(quad.clone()) {
                             hash_map::Entry::Occupied(mut entry) => {
                                 let conn = entry.get_mut();
-                                conn.on_packet(&nic, ip, tcp, data)
-                                    .map_err(|e| eprintln!("Error processing packet: {:?}", e))
-                                    .ok();
+                                match conn.on_packet(&nic, ip, tcp, data) {
+                                    Ok(avail) => {
+                                        drop(cm_guard);
+                                        if avail.contains(Available::READ) {
+                                            ih.receive_var.notify_all();
+                                        }
+                                        if avail.contains(Available::WRITE) {
+                                            // ih.send_var.notify_all();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Error processing packet: {:?}", e);
+                                    }
+                                }
                             }
                             hash_map::Entry::Vacant(e) => {
                                 if let Some(pending) = cm.pending.get_mut(&dstp) {
@@ -211,28 +226,33 @@ pub struct TcpStream {
 impl io::Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut cm = self.ih.manager.lock().unwrap();
-        let conn = cm
-            .connections
-            .get_mut(&self.quad)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Connection closed"))?;
+        loop {
+            let conn = cm
+                .connections
+                .get_mut(&self.quad)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Connection closed"))?;
 
-        if conn.ingress.is_empty() {
-            // TODO: Block if no data
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Nothing to read"));
+            if conn.is_recv_closed() && conn.ingress.is_empty() {
+                // No more data to read
+                return Ok(0);
+            }
+
+            if !conn.ingress.is_empty() {
+                let mut nread = 0;
+                let (head, tail) = conn.ingress.as_slices();
+                let hread = std::cmp::min(buf.len(), head.len());
+                buf.copy_from_slice(&head[..hread]);
+                nread += hread;
+                let tread = std::cmp::min(buf.len() - nread, tail.len());
+                buf.copy_from_slice(&tail[..tread]);
+                nread += tread;
+                drop(conn.ingress.drain(..nread));
+                return Ok(nread);
+            }
+
+            // return Err(io::Error::new(io::ErrorKind::WouldBlock, "Nothing to read"));
+            cm = self.ih.receive_var.wait(cm).unwrap();
         }
-
-        // TODO: Detect FIN and return nread = 0
-
-        let mut nread = 0;
-        let (head, tail) = conn.ingress.as_slices();
-        let hread = std::cmp::min(buf.len(), head.len());
-        buf.copy_from_slice(&head[..hread]);
-        nread += hread;
-        let tread = std::cmp::min(buf.len() - nread, tail.len());
-        buf.copy_from_slice(&tail[..tread]);
-        nread += tread;
-        drop(conn.ingress.drain(..nread));
-        Ok(nread)
     }
 }
 
@@ -288,7 +308,7 @@ impl TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let mut cm = self.ih.manager.lock().unwrap();
+        let _cm = self.ih.manager.lock().unwrap();
         // if let Some(_conn) = cm.connections.remove(&self.quad) {
         //     // TODO: Send FIN
         // }

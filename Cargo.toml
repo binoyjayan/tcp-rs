@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+bitflags = "2.5.0"
 etherparse = "0.14.3"
 tun-tap = "0.1.4"
 

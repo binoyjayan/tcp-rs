@@ -6,7 +6,7 @@ use std::net::Ipv4Addr;
 
 use super::sequence::ReceiveSequenceSpace;
 use super::sequence::SendSequenceSpace;
-use super::state::State;
+use super::state::{Available, State};
 
 const TTL: u8 = 64;
 const ISS: u32 = 0; // Needs to change
@@ -31,6 +31,26 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// Any state after receiving FIN
+    pub fn is_recv_closed(&self) -> bool {
+        if let State::TimeWait = self.state {
+            // TODO: CLOSE-WAIT, LAST-ACK, CLOSED, CLOSING
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Function to indicate read and write availability
+    fn availability(&self) -> Available {
+        let mut avail = Available::empty();
+        if self.is_recv_closed() || !self.ingress.is_empty() {
+            avail |= Available::READ;
+        }
+        // TODO: set Available::WRITE
+        avail
+    }
+
     pub fn accept(
         nic: &tun_tap::Iface,
         ip: Ipv4HeaderSlice,
@@ -143,7 +163,7 @@ impl Connection {
         _ip: Ipv4HeaderSlice,
         tcp: TcpHeaderSlice,
         data: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<Available> {
         // First check if sequence numbers are valid
         let seq = tcp.sequence_number();
         let mut slen = data.len() as u32;
@@ -185,7 +205,7 @@ impl Connection {
         if !okay {
             // Not acceptable
             self.write(nic, &[])?;
-            return Ok(());
+            return Ok(self.availability());
         }
         // Adjust receive sequence space: we have accepted the segment
         self.receive.nxt = seq.wrapping_add(slen);
@@ -194,7 +214,7 @@ impl Connection {
         // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 
         if !tcp.ack() {
-            return Ok(());
+            return Ok(self.availability());
         }
         let ack = tcp.acknowledgment_number();
         // Acceptable ACK check: SND.UNA < SEG.ACK =< SND.NXT
@@ -214,10 +234,10 @@ impl Connection {
         }
 
         if let State::Established | State::FinWait1 | State::FinWait2 = self.state {
-            if !Self::is_between_wrapped(self.send.una, ack, self.send.nxt.wrapping_add(1)) {
-                return Ok(());
+            if Self::is_between_wrapped(self.send.una, ack, self.send.nxt.wrapping_add(1)) {
+                self.send.una = ack;
             }
-            self.send.una = ack;
+
             if !data.is_empty() {
                 println!("Data is not empty");
             }
@@ -248,7 +268,7 @@ impl Connection {
             }
         }
 
-        Ok(())
+        Ok(self.availability())
     }
 
     /// TCP half-domain wrapping

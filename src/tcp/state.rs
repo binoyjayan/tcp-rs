@@ -1,3 +1,5 @@
+use bitflags::bitflags;
+
 /// A connection progresses through a series of states during its lifetime.
 /// The states are: `Closed`, `Listen`, `SynReceived`, `Established`, `FinWait1`,
 /// `FinWait2`, `CloseWait`, `Closing`, `LastAck`, `TimeWait`, and the fictional
@@ -56,5 +58,13 @@ impl State {
             self,
             Self::Established | Self::FinWait1 | Self::FinWait2 | Self::TimeWait
         )
+    }
+}
+
+// Indicates the readiness of reading or writing
+bitflags! {
+    pub struct Available: u8 {
+        const READ = 0b00000001;
+        const WRITE = 0b00000010;
     }
 }
