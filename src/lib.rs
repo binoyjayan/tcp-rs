@@ -6,6 +6,9 @@ use std::{
     thread,
 };
 
+use nix::poll;
+use std::os::unix::io::{AsRawFd, BorrowedFd};
+
 mod tcp;
 
 use tcp::{
@@ -50,7 +53,19 @@ fn packet_loop(nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
     let mut buf = [0u8; BUFFER_SIZE];
 
     loop {
-        // TODO: timeout
+        // Read from nic with an ability to timeout
+        let fd = unsafe { BorrowedFd::borrow_raw(nic.as_raw_fd()) };
+        let mut pfd = [poll::PollFd::new(fd, poll::PollFlags::POLLIN)];
+        let n = poll::poll(&mut pfd[..], 1u16)?;
+        if n == 0 {
+            // Timeout
+            let mut cmg = ih.manager.lock().unwrap();
+            // let cm = &mut *cm_guard;
+            for conn in cmg.connections.values_mut() {
+                let _ = conn.on_timer(&nic);
+            }
+            continue;
+        }
         let nbytes = nic.recv(&mut buf[..])?;
         let version = buf[0] >> 4;
         if version != 4 {
@@ -140,10 +155,13 @@ impl Interface {
 
         let jh = {
             let ih = ih.clone();
-            Some(thread::spawn(move || packet_loop(nic, ih)))
+            thread::spawn(move || packet_loop(nic, ih))
         };
 
-        Ok(Interface { ih: Some(ih), jh })
+        Ok(Interface {
+            ih: Some(ih),
+            jh: Some(jh),
+        })
     }
     pub fn bind(&mut self, port: u16) -> io::Result<TcpListener> {
         let mut cm = self.ih.as_mut().unwrap().manager.lock().unwrap();
@@ -250,7 +268,6 @@ impl io::Read for TcpStream {
                 return Ok(nread);
             }
 
-            // return Err(io::Error::new(io::ErrorKind::WouldBlock, "Nothing to read"));
             cm = self.ih.receive_var.wait(cm).unwrap();
         }
     }
@@ -276,7 +293,6 @@ impl io::Write for TcpStream {
         let nwrite = std::cmp::min(buf.len(), SEND_QUEUE_SIZE - conn.unacked.len());
         conn.unacked.extend(&mut buf[..nwrite].iter());
 
-        // TODO: Schedule wakeup
         Ok(nwrite)
     }
 
@@ -302,6 +318,14 @@ impl io::Write for TcpStream {
 impl TcpStream {
     pub fn shutdown(&self, _how: std::net::Shutdown) -> io::Result<()> {
         // TODO: Send FIN
+        let mut cm = self.ih.manager.lock().unwrap();
+
+        let conn = cm
+            .connections
+            .get_mut(&self.quad)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Connection closed"))?;
+
+        conn.close()?;
         Ok(())
     }
 }

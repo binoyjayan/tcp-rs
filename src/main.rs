@@ -11,13 +11,15 @@ fn main() -> io::Result<()> {
     let jh1 = thread::spawn(move || {
         while let Ok(mut stream) = list1.accept() {
             eprintln!("Connected");
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
             loop {
                 let mut buf = [0u8; 512];
                 let n = stream.read(&mut buf).unwrap();
-                eprintln!("Read {} bytes of data", n);
                 if n == 0 {
+                    println!("EOF");
                     break;
                 }
+                println!("[{}]{}", n, std::string::String::from_utf8_lossy(&buf[..n]));
             }
         }
     });
@@ -25,3 +27,4 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+// 4:02

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 bitflags = "2.5.0"
 etherparse = "0.14.3"
+nix = { version = "0.29.0", features = ["poll"] }
 tun-tap = "0.1.4"
 
 [lib]
