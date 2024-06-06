@@ -150,24 +150,19 @@ impl Connection {
         Ok(conn)
     }
 
-    pub fn write(
-        &mut self,
-        nic: &tun_tap::Iface,
-        seq: u32,
-        // offset: usize,
-        limit: usize,
-    ) -> io::Result<usize> {
+    fn write(&mut self, nic: &tun_tap::Iface, seq: u32, mut limit: usize) -> io::Result<usize> {
         let mut buf = [0u8; MTU];
         self.tcp.sequence_number = seq;
         self.tcp.acknowledgment_number = self.receive.nxt;
-
         let mut offset = seq.wrapping_sub(self.send.una) as usize;
 
         // Handle special cases of SYN and FIN
         // If asked to send bytes starting at after SYN/FIN, do not read any data
         if let Some(closed_at) = self.closed_at {
             if seq == closed_at.wrapping_add(1) {
+                // trying to write following FIN
                 offset = 0;
+                limit = 0;
             }
         }
 
@@ -180,38 +175,51 @@ impl Connection {
             t = &t[(offset - skipped)..];
         }
 
-        let max_data: usize = std::cmp::min(limit, h.len() + t.len());
-
+        let max_data = std::cmp::min(limit, h.len() + t.len());
         let size = std::cmp::min(
             buf.len(),
-            self.ip.header_len() + self.tcp.header_len() + max_data,
+            self.tcp.header_len() as usize + self.ip.header_len() as usize + max_data,
         );
-        let _ = self.ip.set_payload_len(size - self.ip.header_len());
+        let _ = self
+            .ip
+            .set_payload_len(size - self.ip.header_len() as usize);
+
+        // write out the headers and the payload
+        let buf_len = buf.len();
+        let mut unwritten = &mut buf[..];
+
+        self.ip.write(&mut unwritten)?;
+        let ip_header_ends_at = buf_len - unwritten.len();
+
+        // postpone writing the tcp header because we need the payload as one contiguous slice to calculate the tcp checksum
+        unwritten = &mut unwritten[self.tcp.header_len() as usize..];
+        let tcp_hdr_end_off = buf_len - unwritten.len();
+
+        // write out the payload
+        let payload_bytes = {
+            let mut written = 0;
+            let mut limit = max_data;
+
+            // Write as much as we can from head
+            let p1len = std::cmp::min(limit, h.len());
+            written += unwritten.write(&h[..p1len])?;
+            limit -= written;
+
+            // Write more from tail
+            let p2len = std::cmp::min(limit, t.len());
+            written += unwritten.write(&t[..p2len])?;
+            written
+        };
+        let payload_end_off = buf_len - unwritten.len();
 
         // Calculate checksum
         self.tcp.checksum = self
             .tcp
-            .calc_checksum_ipv4(&self.ip, &[])
-            .expect("checksum failed");
-        let mut cursor = io::Cursor::new(&mut buf[..]);
-        self.ip.write(&mut cursor)?;
-        self.tcp.write(&mut cursor)?;
+            .calc_checksum_ipv4(&self.ip, &buf[tcp_hdr_end_off..payload_end_off])
+            .expect("failed to compute checksum");
 
-        let payload_bytes = {
-            let mut written = 0;
-            // write as much as possible from h
-            let mut limit = max_data;
-            let p1len = std::cmp::min(limit, h.len());
-            written += cursor.write(&h[..p1len])?;
-            limit -= written;
-
-            // write more from t
-            let p2len = std::cmp::min(limit, t.len());
-            written += cursor.write(&t[..p2len])?;
-            // limit -= written;
-            written
-        };
-        let len = cursor.position() as usize;
+        let mut tcp_header_buf = &mut buf[ip_header_ends_at..tcp_hdr_end_off];
+        self.tcp.write(&mut tcp_header_buf)?;
 
         // Adjust send sequence space
         let mut next_seq = seq.wrapping_add(payload_bytes as u32);
@@ -224,14 +232,12 @@ impl Connection {
             next_seq = next_seq.wrapping_add(1);
             self.tcp.fin = false;
         }
-        // self.send.nxt = self.send.nxt.wrapping_add(payload_bytes as u32);
         if Self::wrapping_lt(self.send.nxt, next_seq) {
             self.send.nxt = next_seq;
         }
-
         self.timers.send_times.insert(seq, time::Instant::now());
 
-        nic.send(&buf[0..len])?;
+        nic.send(&buf[..payload_end_off])?;
         Ok(payload_bytes)
     }
 
@@ -318,11 +324,17 @@ impl Connection {
         if let State::Established | State::FinWait1 | State::FinWait2 = self.state {
             if Self::is_between_wrapped(self.send.una, ack, self.send.nxt.wrapping_add(1)) {
                 // Remove ACK-ed bytes from retransmission queue
-                let nbytes = ack.wrapping_sub(self.send.una) as usize;
                 if !self.unacked.is_empty() {
-                    let _acked = self.unacked.drain(..nbytes).count();
-                    // let mut old = std::mem::replace(&mut self.timers.send_times, BTreeMap::new());
-                    // self.timers.send_times.extend(old.into_iter().filter_map(f));
+                    let data_start = if self.send.una == self.send.iss {
+                        // send.una hasn't been updated yet with ACK for SYN
+                        self.send.una.wrapping_add(1)
+                    } else {
+                        self.send.una
+                    };
+                    let acked_data_end =
+                        std::cmp::min(ack.wrapping_sub(data_start) as usize, self.unacked.len());
+                    self.unacked.drain(..acked_data_end);
+
                     self.timers.send_times.retain(|seq, sent| {
                         if Self::is_between_wrapped(self.send.una, *seq, ack) {
                             let rtt = sent.elapsed().as_secs_f64();
@@ -336,47 +348,52 @@ impl Connection {
 
                 self.send.una = ack;
             }
-
-            // Since we do not have anything to send, indicate FIN from us
-            // if let State::Established = self.state {
-            //     self.tcp.fin = true;
-            //     self.state = State::FinWait1;
-            // }
         }
 
         if let State::FinWait1 = self.state {
-            if self.send.una == self.send.iss + 2 {
-                // Sender would have ACK-ed our FIN.
-                self.state = State::FinWait2;
+            if let Some(closed_at) = self.closed_at {
+                if self.send.una == closed_at.wrapping_add(1) {
+                    // Sender would have ACK-ed our FIN.
+                    self.state = State::FinWait2;
+                }
             }
         }
 
         // Handle reads
-        if let State::Established | State::FinWait1 | State::FinWait2 = self.state {
-            // offset to unread data
-            let mut offset = self.receive.nxt.saturating_sub(seq) as usize;
-            // nxt points to beyond the FIN but FIN is not in data
-            if offset > data.len() {
-                offset = offset.saturating_sub(1);
+        if !data.is_empty() {
+            if let State::Established | State::FinWait1 | State::FinWait2 = self.state {
+                // offset to unread data
+                let mut data_off = self.receive.nxt.wrapping_sub(seq) as usize;
+                if data_off > data.len() {
+                    // we must have received a re-transmitted FIN that we have already seen
+                    // nxt points to beyond the FIN, but the FIN is not in data!
+                    assert_eq!(data_off, data.len() + 1);
+                    data_off = 0;
+                }
+                self.ingress.extend(&data[data_off..]);
+
+                // Adjust receive sequence space: we have accepted the segment
+                // Once the TCP takes responsibility for the data it advances
+                // RCV.NXT over the data accepted, and adjusts RCV.WND as
+                // appropriate to the current buffer availability.  The total of
+                // RCV.NXT and RCV.WND should not be reduced.
+                self.receive.nxt = seq.wrapping_add(data.len() as u32);
+
+                // Send ACK: <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                self.write(nic, self.send.nxt, 0)?;
             }
-
-            self.ingress.extend(&data[offset..]);
-            // Adjust receive sequence space: we have accepted the segment
-
-            self.receive.nxt = seq
-                .wrapping_add(data.len() as u32)
-                .wrapping_add(if tcp.fin() { 1 } else { 0 });
-
-            // Send ACK. Piggyback ACK on data?
-            self.write(nic, self.send.nxt, 0)?;
         }
 
         if tcp.fin() {
-            if let State::FinWait2 = self.state {
-                // Connection terminated
-                // Sender would have ACK-ed our FIN - ACK sender's FIN
-                self.write(nic, self.send.nxt, 0)?;
-                self.state = State::TimeWait;
+            match self.state {
+                State::FinWait2 => {
+                    // Connection terminated
+                    self.receive.nxt = self.receive.nxt.wrapping_add(1);
+                    // Sender would have ACK-ed our FIN - ACK sender's FIN
+                    self.write(nic, self.send.nxt, 0)?;
+                    self.state = State::TimeWait;
+                }
+                _ => unimplemented!(),
             }
         }
 
@@ -386,9 +403,21 @@ impl Connection {
     /// Decide if something needs to be transmitted. Check if we have
     /// space in the window. If so, transmit it.
     pub fn on_timer(&mut self, nic: &tun_tap::Iface) -> io::Result<()> {
+        if let State::FinWait2 | State::TimeWait = self.state {
+            // Shutdown write from our side and the peer ACKed, no need to (re)transmit anything
+            return Ok(());
+        }
+
         // bytes sent but not ACK-ed
-        let unacked = self.send.nxt.wrapping_sub(self.send.una);
+
+        // let unacked = self.send.nxt.wrapping_sub(self.send.una);
+        let unacked = self
+            .closed_at
+            .unwrap_or(self.send.nxt)
+            .wrapping_sub(self.send.una);
+
         // bytes not sent yet
+        // let unsent = self.unacked.len() as u32 - unacked;
         let unsent = self.unacked.len() as u32 - unacked;
 
         // Get the elapsed time of the first unacked send time
@@ -409,6 +438,7 @@ impl Connection {
         if should_restransmit {
             // retransmit
             let resend = std::cmp::min(self.unacked.len() as u32, self.send.wnd as u32);
+            // Also check 'self.unacked.len() == 0' if FIN shouldn't be piggybacked to data
             if resend < self.send.wnd as u32 && self.closed_at.is_some() {
                 // If no data to send and connection was closed, do nothing
                 self.tcp.fin = true;
@@ -426,20 +456,12 @@ impl Connection {
                 return Ok(());
             }
             let send = std::cmp::min(unsent, allowed);
+            // Also check 'unsent == 0' if FIN shouldn't be piggybacked to data
             if send < allowed && self.closed && self.closed_at.is_none() {
                 // Send FIN
                 self.tcp.fin = true;
                 self.closed_at = Some(self.send.nxt.wrapping_add(self.unacked.len() as u32));
             }
-            // let (mut h, mut t) = self.unacked.as_slices();
-            // we want self.unacked[unacked..]
-            // if h.len() >= unacked as usize {
-            //     h = &h[unacked as usize..];
-            // } else {
-            //     let skipped = h.len();
-            //     h = &[];
-            //     t = &t[(unacked as usize - skipped)..];
-            // }
             self.write(nic, self.send.nxt, send as usize)?;
         }
 
